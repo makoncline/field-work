@@ -28,6 +28,8 @@ import {
   Rewind,
   FastForward,
 } from "lucide-react";
+import { usePorcupine } from "@picovoice/porcupine-react";
+import { env } from "@/env";
 
 interface VideoDevice {
   deviceId: string;
@@ -92,6 +94,9 @@ interface FFmpegOutputFile {
 // --- Clip Management ---
 const MAX_SAVED_CLIPS = 5; // Keep the last 5 generated clips
 
+// Define a constant for frame duration
+const FRAME_DURATION = 1 / 30; // Assuming 30fps
+
 export default function CameraPage() {
   const [devices, setDevices] = useState<VideoDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | undefined>(
@@ -107,8 +112,7 @@ export default function CameraPage() {
   // --- Speech Recognition State ---
   const [isListening, setIsListening] = useState(false);
   const [speechError, setSpeechError] = useState<string | null>(null);
-  const [isSpeechRecognitionSupported, setIsSpeechRecognitionSupported] =
-    useState(true);
+  const [isPorcupineSupported, setIsPorcupineSupported] = useState(true);
   // --- State for selected clip playback ---
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null); // ID of the selected clip
   const [selectedClipTime, setSelectedClipTime] = useState(0);
@@ -137,6 +141,24 @@ export default function CameraPage() {
   const seekTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Ref to track if processing was intentionally triggered
   const processIntentRef = useRef(false);
+
+  // --- Porcupine Wake Word Detection ---
+  const porcupineHook = usePorcupine();
+  const keywordDetection = porcupineHook.keywordDetection;
+  // Use type assertions for the values from usePorcupine to resolve TypeScript errors
+  const isPorcupineLoaded = porcupineHook.isLoaded;
+  const isPorcupineListening = porcupineHook.isListening;
+  const porcupineError = porcupineHook.error as string | null;
+  const initPorcupine = porcupineHook.init as (
+    accessKey: string,
+    keyword:
+      | { publicPath: string; label: string }
+      | Array<{ publicPath: string; label: string }>,
+    model: { publicPath: string },
+  ) => Promise<void>;
+  const startPorcupine = porcupineHook.start as () => Promise<void>;
+  const stopPorcupine = porcupineHook.stop as () => Promise<void>;
+  const releasePorcupine = porcupineHook.release as () => Promise<void>;
 
   const getDevices = useCallback(async () => {
     try {
@@ -626,166 +648,99 @@ export default function CameraPage() {
     };
   }, []); // No dependencies - relies only on refs and constants
 
-  // --- Initialize and manage Speech Recognition ---
+  // --- Initialize and manage Porcupine Wake Word Detection ---
   useEffect(() => {
-    const SpeechRecognitionAPI =
-      window.SpeechRecognition ?? window.webkitSpeechRecognition;
+    // Get the Picovoice AccessKey from environment variables
+    const ACCESS_KEY = env.NEXT_PUBLIC_PICOVOICE_ACCESS_KEY;
 
-    if (!SpeechRecognitionAPI) {
-      console.error(
-        "Web Speech Recognition API not supported in this browser.",
-      );
-      setIsSpeechRecognitionSupported(false);
-      return;
-    }
-
-    console.log("Initializing Speech Recognition...");
-    const recognition = new SpeechRecognitionAPI();
-    // @ts-ignore - Workaround for persistent type resolution issues
-    speechRecognitionRef.current = recognition as any;
-
-    // @ts-ignore
-    recognition.continuous = true;
-    // @ts-ignore
-    recognition.interimResults = false;
-    // @ts-ignore
-    recognition.lang = "en-US";
-
-    // @ts-ignore
-    recognition.onstart = () => {
-      console.log("Speech recognition service started successfully.");
-      lastSpeechErrorRef.current = null; // Clear last error on successful start
-      setIsListening(true); // Explicitly set listening true on start
+    // Define the wake word model configuration
+    const porcupineKeyword = {
+      publicPath: "/porcupine_models/save-it_en_wasm_v3_0_0.ppn",
+      label: "save it", // Update label to match the actual wake word
     };
 
-    // @ts-ignore
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      // Type is now inferred from installed @types
-      const last = event.results.length - 1;
-      const transcript = event.results?.[last]?.[0]?.transcript
-        ?.toLowerCase()
-        ?.trim();
-
-      console.log("Speech recognized:", transcript);
-      setSpeechError(null); // Clear previous errors on successful recognition
-
-      // Check if the transcript is one of the accepted trigger words
-      const triggerWords = ["loop", "luke", "poop", "go"];
-      if (transcript && triggerWords.includes(transcript)) {
-        console.log('"Loop" trigger word detected!');
-        // Use a direct call instead of depending on useCallback version
-        // which might be stale within this event handler
-        // Use void to explicitly ignore the promise from the async function
-        void handleLoopTrigger();
-      }
+    // Define the Porcupine model
+    const porcupineModel = {
+      publicPath: "/porcupine_models/porcupine_params.pv",
     };
 
-    // @ts-ignore
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      console.error("Speech recognition error:", event.error, event.message);
-      setSpeechError(`Speech error: ${event.error} - ${event.message}`);
-      lastSpeechErrorRef.current = event.error; // Store the error type
-      // Don't set isListening false here, let onend handle it
-    };
+    console.log("Initializing Porcupine wake word detection...");
 
-    // @ts-ignore
-    recognition.onend = () => {
-      console.log("Speech recognition service ended.");
-      const lastError = lastSpeechErrorRef.current;
-      lastSpeechErrorRef.current = null; // Clear error after checking
-
-      // Check if we *intended* to be listening when it ended
-      if (intendedListeningStateRef.current) {
-        // Only restart if the error wasn't potentially persistent/fatal
-        if (
-          lastError &&
-          (lastError === "network" ||
-            lastError === "audio-capture" ||
-            lastError === "not-allowed" ||
-            lastError === "service-not-allowed")
-        ) {
-          console.warn(`Not attempting restart after error: ${lastError}`);
-          setIsListening(false); // Ensure listening is marked as off
-          intendedListeningStateRef.current = false; // Reset intended state as well
-        } else {
-          console.log(
-            `Service ended ${lastError ? `after error: ${lastError}` : "normally/timeout"}. Attempting restart...`,
-          );
-          // Attempt restart after a delay
-          setTimeout(() => {
-            // Re-check refs in case user manually stopped during delay
-            if (
-              intendedListeningStateRef.current &&
-              speechRecognitionRef.current
-            ) {
-              try {
-                // @ts-ignore
-                speechRecognitionRef.current?.start();
-                console.log("Speech recognition restart attempt initiated.");
-                // Note: isListening will be set true by onstart if successful
-              } catch (e) {
-                console.error(
-                  "Error attempting to restart speech recognition:",
-                  e,
-                );
-                setIsListening(false); // Definitely failed, set to false
-                intendedListeningStateRef.current = false; // Update intended state too
-              }
-            } else {
-              console.log(
-                "Not restarting, intended state is now false or ref is null.",
-              );
-              setIsListening(false); // Ensure state is false if we aren't restarting
-            }
-          }, 3000); // 3s delay before restart attempt
-        }
-      } else {
-        // If we weren't intending to listen (i.e., manual stop), ensure state is false
-        setIsListening(false);
-      }
-    };
+    // Initialize Porcupine
+    initPorcupine(ACCESS_KEY, porcupineKeyword, porcupineModel).catch(
+      (error) => {
+        console.error("Failed to initialize Porcupine:", error);
+        setSpeechError(
+          `Failed to initialize wake word detection: ${String(error)}`,
+        );
+        setIsPorcupineSupported(false);
+      },
+    );
 
     // Cleanup function
     return () => {
-      if (speechRecognitionRef.current) {
-        console.log("Stopping speech recognition.");
-        // @ts-ignore
-        speechRecognitionRef.current?.stop();
-        speechRecognitionRef.current = null;
+      if (isPorcupineListening) {
+        console.log("Releasing Porcupine resources...");
+        void releasePorcupine();
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Run only once on mount
 
+  // Handle wake word detection
+  useEffect(() => {
+    if (keywordDetection !== null) {
+      // Type-safe access to label with fallback
+      const label =
+        typeof keywordDetection === "object" && keywordDetection !== null
+          ? String(keywordDetection?.label ?? "unknown")
+          : "unknown";
+
+      console.log(`Wake word detected: ${label}`);
+      setSpeechError(null); // Clear previous errors on successful detection
+
+      // Trigger the loop action when wake word is detected
+      void handleLoopTrigger();
+    }
+  }, [keywordDetection]);
+
+  // Update UI state based on Porcupine state
+  useEffect(() => {
+    setIsListening(isPorcupineListening);
+
+    if (porcupineError) {
+      console.error("Porcupine error:", porcupineError);
+      const errorMessage =
+        typeof porcupineError === "object" && porcupineError !== null
+          ? String(porcupineError)
+          : "Unknown error";
+      setSpeechError(`Wake word detection error: ${errorMessage}`);
+    }
+  }, [isPorcupineListening, porcupineError]);
+
   // --- Speech Recognition Control Functions ---
   const startListening = useCallback(() => {
-    if (speechRecognitionRef.current && !isListening) {
-      console.log("Starting speech recognition...");
+    if (isPorcupineLoaded && !isPorcupineListening) {
+      console.log("Starting wake word detection...");
       try {
-        intendedListeningStateRef.current = true; // Set intended state
-        lastSpeechErrorRef.current = null; // Clear last error on manual start
         setSpeechError(null);
-        // @ts-ignore
-        speechRecognitionRef.current?.start();
+        void startPorcupine();
       } catch (e) {
-        console.error("Error starting speech recognition:", e);
-        setError(
-          `Failed to start listening: ${e instanceof Error ? e.message : String(e)}`,
+        console.error("Error starting wake word detection:", e);
+        setSpeechError(
+          `Failed to start wake word detection: ${e instanceof Error ? e.message : String(e)}`,
         );
-        intendedListeningStateRef.current = false; // Failed to start, reset intended
         setIsListening(false);
       }
     }
-  }, [isListening]);
+  }, [isPorcupineLoaded, isPorcupineListening, startPorcupine]);
 
   const stopListening = useCallback(() => {
-    if (speechRecognitionRef.current && isListening) {
-      console.log("Manually stopping speech recognition...");
-      intendedListeningStateRef.current = false; // Set intended state
-      // @ts-ignore
-      speechRecognitionRef.current?.stop();
+    if (isPorcupineListening) {
+      console.log("Stopping wake word detection...");
+      void stopPorcupine();
     }
-  }, [isListening]);
+  }, [isPorcupineListening, stopPorcupine]);
 
   // --- Updated handleLoopTrigger (Checks ref state instead of prop state) ---
   const handleLoopTrigger = useCallback(async () => {
@@ -1318,33 +1273,33 @@ export default function CameraPage() {
             </Button>
 
             {/* --- Speech Recognition Controls --- */}
-            {isSpeechRecognitionSupported ? (
-              <div className="flex items-center gap-2">
-                <Button
-                  variant={isListening ? "destructive" : "outline"}
-                  size="icon"
-                  onClick={isListening ? stopListening : startListening}
-                  title={
-                    isListening
-                      ? "Stop Listening"
-                      : "Start Listening for 'loop' command"
-                  }
-                >
-                  {isListening ? (
-                    <MicOff className="h-5 w-5" />
-                  ) : (
-                    <Mic className="h-5 w-5" />
-                  )}
-                </Button>
-                <span
-                  className={`text-sm ${isListening ? "text-green-600" : "text-muted-foreground"}`}
-                >
-                  {isListening ? "Listening..." : "Mic Off"}
-                </span>
+            {isPorcupineSupported ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant={isListening ? "destructive" : "outline"}
+                    size="icon"
+                    onClick={isListening ? stopListening : startListening}
+                    title={
+                      isListening ? "Stop Listening" : "Listening for 'save it'"
+                    }
+                  >
+                    {isListening ? (
+                      <MicOff className="h-5 w-5" />
+                    ) : (
+                      <Mic className="h-5 w-5" />
+                    )}
+                  </Button>
+                  <span
+                    className={`text-sm ${isListening ? "text-green-600" : "text-muted-foreground"}`}
+                  >
+                    {isListening ? "Listening for 'save it'..." : "Mic Off"}
+                  </span>
+                </div>
               </div>
             ) : (
               <p className="text-destructive text-sm">
-                Speech recognition not supported.
+                Wake word detection not supported.
               </p>
             )}
           </div>
@@ -1352,7 +1307,7 @@ export default function CameraPage() {
           {speechError && (
             <Alert variant="destructive" className="mt-2">
               <Terminal className="h-4 w-4" />
-              <AlertTitle>Speech Recognition Error</AlertTitle>
+              <AlertTitle>Wake Word Detection Error</AlertTitle>
               <AlertDescription>{speechError}</AlertDescription>
             </Alert>
           )}
@@ -1556,10 +1511,10 @@ export default function CameraPage() {
                       {/* Stop propagation */}
                       <Slider
                         max={selectedClipDuration}
-                        step={frameDuration} // Use frameDuration for step?
+                        step={FRAME_DURATION} // Use defined constant
                         value={[selectedClipTime]}
-                        disabled={!selectedClipDuration} // Disable if duration is 0 or clip not selected
-                        onValueChange={handleSliderChange} // Use the new handler with debounce logic
+                        disabled={!selectedClipDuration}
+                        onValueChange={handleSliderChange}
                         className="h-2 w-full"
                       />
                     </div>
@@ -1573,6 +1528,3 @@ export default function CameraPage() {
     </main>
   );
 }
-
-// Add frameDuration constant outside component if needed globally or define locally
-const frameDuration = 1 / 30; // Assuming 30fps - Needs to be accessible by Slider step
