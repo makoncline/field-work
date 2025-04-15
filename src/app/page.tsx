@@ -12,6 +12,8 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Terminal,
   Play,
@@ -35,7 +37,6 @@ interface VideoDevice {
 // Option 1: Continuous recording with small timeslices
 const RECORDING_TIMESLICE_MS = 1000; // How often ondataavailable fires (Increased to 1s)
 const BUFFER_DURATION_MS = 3000; // Keep ~3 seconds of chunks
-const TARGET_LOOP_DURATION_MS = 5000; // Duration of the loop clip to generate (Changed to 5s)
 // --- New constants/refs for long recording + trim approach ---
 const MAX_RECORD_DURATION_MS = 60000; // Max 60 seconds recording before auto-processing
 
@@ -113,6 +114,8 @@ export default function CameraPage() {
   const [selectedClipTime, setSelectedClipTime] = useState(0);
   const [selectedClipDuration, setSelectedClipDuration] = useState(0);
   const [isSelectedClipPlaying, setIsSelectedClipPlaying] = useState(false); // Track play/pause state
+  // --- State for configurable duration ---
+  const [targetDurationInputMs, setTargetDurationInputMs] = useState("3000"); // Default to 5s
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -132,6 +135,8 @@ export default function CameraPage() {
   const videoRefs = useRef<Map<string, HTMLVideoElement | null>>(new Map());
   // Ref for debouncing slider video seek
   const seekTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref to track if processing was intentionally triggered
+  const processIntentRef = useRef(false);
 
   const getDevices = useCallback(async () => {
     try {
@@ -253,9 +258,27 @@ export default function CameraPage() {
       return;
     }
 
-    if (recordingDuration < TARGET_LOOP_DURATION_MS) {
-      console.error("Recording too short for desired clip.");
-      setError("Recording too short for desired loop clip.");
+    // --- Get target duration from state ---
+    let targetMs = parseInt(targetDurationInputMs, 10);
+    // Validate: Use 5000ms (5s) as default/minimum if input is invalid or too small
+    if (isNaN(targetMs) || targetMs <= 500) {
+      // Min 0.5s?
+      console.warn(
+        `Invalid target duration input '${targetDurationInputMs}', using default 5000ms`,
+      );
+      targetMs = 5000;
+    }
+    const targetDurationSec = targetMs / 1000;
+    // ---------------------------------------
+
+    if (recordingDuration < targetMs) {
+      // <-- Use parsed targetMs
+      console.error(
+        `Recording too short (${recordingDuration}ms) for desired clip (${targetMs}ms).`,
+      );
+      setError(
+        `Recording too short for desired ${targetDurationSec}s loop clip.`,
+      );
       setIsProcessing(false); // Ensure processing stops
       // Restart recording
       createAndStartRecorder();
@@ -263,9 +286,9 @@ export default function CameraPage() {
     }
 
     // Calculate trim parameters
-    const offsetMs = recordingDuration - TARGET_LOOP_DURATION_MS;
+    const offsetMs = recordingDuration - targetMs; // <-- Use parsed targetMs
     const offsetSec = Math.max(0, offsetMs / 1000); // Ensure offset isn't negative
-    const targetDurationSec = TARGET_LOOP_DURATION_MS / 1000;
+    // targetDurationSec already calculated above
 
     console.log(
       `Trimming clip from offset: ${offsetSec.toFixed(3)}s for ${targetDurationSec}s duration.`,
@@ -408,15 +431,31 @@ export default function CameraPage() {
 
       // --- Updated onstop handler ---
       newRecorder.onstop = async () => {
-        console.warn("Recorder stopped. Processing recording...");
+        console.warn("Recorder stopped.");
         setRecorderStatus("stopped");
         // Clear the auto-stop timeout now that it's stopped
         if (maxRecordingTimeoutRef.current) {
           clearTimeout(maxRecordingTimeoutRef.current);
           maxRecordingTimeoutRef.current = null;
         }
-        // Process the collected recording
-        await processRecording();
+
+        // Check if the stop was intentionally triggered for processing
+        if (processIntentRef.current) {
+          console.log("Intentional trigger detected, processing recording...");
+          // Reset the intent flag
+          processIntentRef.current = false;
+          // Process the collected recording (which will restart recorder after ffmpeg)
+          await processRecording();
+        } else {
+          // Stop was likely due to timeout or other non-trigger reason
+          console.log(
+            "Stop was not intentionally triggered. Discarding recording and restarting.",
+          );
+          // Clear buffer and start time, then restart immediately
+          recordedChunksRef.current = [];
+          currentRecordingStartTimeRef.current = null;
+          createAndStartRecorder();
+        }
       };
 
       // --- Start recorder without timeslice for one long recording ---
@@ -527,6 +566,23 @@ export default function CameraPage() {
               });
 
               setError(null);
+
+              // --- Play notification sound ---
+              try {
+                // NOTE: User must place a sound file named 'ding.mp3'
+                // (or update path) in the /public directory.
+                const notificationSound = new Audio("/glass.mp3");
+                notificationSound.play().catch((err) => {
+                  // Autoplay policies might prevent sound without prior user interaction
+                  console.warn("Could not play notification sound:", err);
+                });
+              } catch (err) {
+                console.error(
+                  "Error creating/playing notification sound:",
+                  err,
+                );
+              }
+              // --------------------------------
             } else {
               console.error(
                 "FFmpeg finished but output file 'output.webm' not found or data invalid.",
@@ -614,7 +670,7 @@ export default function CameraPage() {
       setSpeechError(null); // Clear previous errors on successful recognition
 
       // Check if the transcript is one of the accepted trigger words
-      const triggerWords = ["loop", "luke"];
+      const triggerWords = ["loop", "luke", "poop", "go"];
       if (transcript && triggerWords.includes(transcript)) {
         console.log('"Loop" trigger word detected!');
         // Use a direct call instead of depending on useCallback version
@@ -773,6 +829,10 @@ export default function CameraPage() {
       maxRecordingTimeoutRef.current = null;
     }
 
+    // Set the intent flag BEFORE stopping the recorder
+    processIntentRef.current = true;
+    console.log("Setting process intent flag to true.");
+
     // Stop the current recorder. The onstop handler will call processRecording.
     mediaRecorderRef.current?.stop();
   }, [isProcessing]); // Only depends on isProcessing now
@@ -909,22 +969,37 @@ export default function CameraPage() {
     [debouncedSeek],
   ); // Depends on debouncedSeek callback
 
-  // --- Effect to auto-select the newest clip --- (Revised)
+  // --- Effect to auto-select the newest clip OR handle selection removal --- (Revised Again)
   useEffect(() => {
     const newestClipId = loopClips[0]?.id ?? null;
-    if (newestClipId && selectedClipId !== newestClipId) {
-      // If there's a newest clip and it's not already selected, select it.
-      console.log(`Auto-selecting newest clip: ${newestClipId}`);
+
+    // Read the current selected ID directly from state within the effect
+    // We don't need it as a dependency, which caused the override issue.
+    const currentSelectedClipId = selectedClipId;
+
+    // Condition 1: No clip currently selected, but clips exist -> Select newest
+    if (!currentSelectedClipId && newestClipId) {
+      console.log(`Auto-selecting initial/newest clip: ${newestClipId}`);
       setSelectedClipId(newestClipId);
-    } else if (loopClips.length === 0 && selectedClipId !== null) {
-      // If clips array becomes empty, clear selection.
-      console.log("No clips remaining, clearing selection.");
+    }
+    // Condition 2: A clip IS selected, but it's no longer in the list -> Select newest (or null)
+    else if (
+      currentSelectedClipId &&
+      !loopClips.some((clip) => clip.id === currentSelectedClipId)
+    ) {
+      console.log(
+        `Selected clip ${currentSelectedClipId} removed. Selecting newest: ${newestClipId ?? "none"}`,
+      );
+      setSelectedClipId(newestClipId); // Select newest, or null if list is now empty
+    }
+    // Condition 3: Clips list is empty and a selection still exists -> Clear selection
+    else if (loopClips.length === 0 && currentSelectedClipId) {
+      console.log("Clips list empty, clearing selection.");
       setSelectedClipId(null);
     }
-    // This runs when loopClips changes OR selectedClipId changes (e.g., user manually clicks)
-    // If the user clicks another clip, this effect will run but won't re-select the newest one
-    // because selectedClipId will already match newestClipId (until a newer clip arrives).
-  }, [loopClips, selectedClipId]); // Keep both dependencies
+
+    // This effect should only run when the list of clips changes.
+  }, [loopClips]); // <<< Dependency ONLY on loopClips
 
   // Main effect for camera access and recorder setup
   useEffect(() => {
@@ -1164,14 +1239,6 @@ export default function CameraPage() {
     };
   }, [selectedClipId]); // Depend only on the selected clip ID
 
-  // Log recorder state on render for debugging
-  console.log(
-    "Render check - Recorder status (state):",
-    recorderStatus,
-    "Processing:",
-    isProcessing,
-  );
-
   return (
     <main className="flex min-h-screen flex-col items-center justify-center p-4 md:p-24">
       <Card className="w-full max-w-3xl">
@@ -1204,6 +1271,23 @@ export default function CameraPage() {
                 ))}
               </SelectContent>
             </Select>
+          </div>
+
+          {/* --- Target Duration Input --- */}
+          <div className="flex items-center gap-2 pt-2">
+            <Label htmlFor="clipDuration" className="whitespace-nowrap">
+              Target Clip Duration (ms):
+            </Label>
+            <Input
+              id="clipDuration"
+              type="number"
+              value={targetDurationInputMs}
+              onChange={(e) => setTargetDurationInputMs(e.target.value)}
+              min="500" // Set a reasonable min
+              step="100"
+              className="w-[100px]"
+              disabled={isProcessing} // Disable only while ffmpeg is processing
+            />
           </div>
 
           {/* --- Live Video Display --- */}
