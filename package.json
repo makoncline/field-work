@@ -58,10 +58,9 @@
     "ffmpeg.js": "^4.2.9003",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.488.0",
-    "next": "^15.2.3",
+    "next": "15.5.28",
     "next-themes": "^0.4.6",
     "react": "^19.0.0",
-    "react-day-picker": "^8.10.1",
     "react-dom": "^19.0.0",
     "react-hook-form": "^7.55.0",
     "react-resizable-panels": "^2.1.7",
@@ -93,5 +92,8 @@
   "ct3aMetadata": {
     "initVersion": "7.39.3"
   },
-  "packageManager": "npm@10.9.0"
+  "packageManager": "npm@10.9.0",
+  "overrides": {
+    "sharp": "0.35.5"
+  }
 }
